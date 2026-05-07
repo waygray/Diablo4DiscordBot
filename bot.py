@@ -67,7 +67,12 @@ def load_subscriptions() -> dict:
 
 
 def save_subscriptions() -> None:
-    fd, temp_path = tempfile.mkstemp(dir=".")
+    target_dir = os.path.abspath(os.path.dirname(SUBSCRIPTIONS_FILE) or ".")
+    fd, temp_path = tempfile.mkstemp(dir=target_dir)
+    try:
+        os.chmod(temp_path, 0o600)
+    except OSError:
+        pass
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
             json.dump(subscriptions, temp_file, indent=2)
@@ -125,11 +130,17 @@ def _safe_parse_us_datetime(value: str) -> datetime | None:
 
 
 def _sanitize_external_text(value: str, max_len: int = 80) -> str:
+    if max_len <= 0:
+        return ""
+
     cleaned = re.sub(r"[\x00-\x1f\x7f]", "", value or "").strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
     cleaned = discord.utils.escape_mentions(cleaned)
     if len(cleaned) > max_len:
-        cleaned = cleaned[: max_len - 1].rstrip() + "…"
+        if max_len == 1:
+            return "…"
+        cleaned = cleaned[:max_len].rstrip()
+        cleaned = cleaned[:-1].rstrip() + "…"
     return cleaned
 
 

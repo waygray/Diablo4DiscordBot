@@ -54,6 +54,11 @@ function Rotate-LogIfNeeded {
     $item = Get-Item $Path -ErrorAction SilentlyContinue
     if (-not $item -or $item.Length -lt $MaxBytes) { return }
 
+    $oldest = "$Path.$MaxBackups"
+    if (Test-Path $oldest) {
+        Remove-Item -Path $oldest -Force -ErrorAction SilentlyContinue
+    }
+
     for ($i = $MaxBackups - 1; $i -ge 1; $i--) {
         $src = "$Path.$i"
         $dst = "$Path." + ($i + 1)
