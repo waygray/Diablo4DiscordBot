@@ -6,7 +6,7 @@ $launcher = Join-Path $projectDir "run_bot_forever.ps1"
 
 $action = New-ScheduledTaskAction `
     -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launcher`""
+    -Argument "-NoProfile -WindowStyle Hidden -File `"$launcher`""
 
 $triggerAtStartup = New-ScheduledTaskTrigger -AtStartup
 $triggerAtLogon = New-ScheduledTaskTrigger -AtLogOn

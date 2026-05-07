@@ -5,6 +5,8 @@ $pythonExe = "C:\Users\waylo\OneDrive\Desktop\Diablo 4 Discord Bot\Diablo4Discor
 $botFile = Join-Path $projectDir "bot.py"
 $logFile = Join-Path $projectDir "bot_runner.log"
 $envFile = Join-Path $projectDir "bot.env"
+$maxLogSizeBytes = 5MB
+$maxLogBackups = 3
 
 Set-Location $projectDir
 
@@ -40,7 +42,45 @@ catch {
     Add-Content -Path $logFile -Value "[$(Get-Date -Format \"yyyy-MM-dd HH:mm:ss\")] Warning: Could not set certifi CA bundle."
 }
 
+function Rotate-LogIfNeeded {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][long]$MaxBytes,
+        [Parameter(Mandatory = $true)][int]$MaxBackups
+    )
+
+    if (-not (Test-Path $Path)) { return }
+
+    $item = Get-Item $Path -ErrorAction SilentlyContinue
+    if (-not $item -or $item.Length -lt $MaxBytes) { return }
+
+    $oldest = "$Path.$MaxBackups"
+    if (Test-Path $oldest) {
+        Remove-Item -Path $oldest -Force -ErrorAction SilentlyContinue
+    }
+
+    for ($i = $MaxBackups - 1; $i -ge 1; $i--) {
+        $src = "$Path.$i"
+        $dst = "$Path." + ($i + 1)
+        if (Test-Path $src) {
+            Move-Item -Path $src -Destination $dst -Force
+        }
+    }
+
+    try {
+        Move-Item -Path $Path -Destination "$Path.1" -Force
+    }
+    catch {
+        $item = Get-Item $Path -ErrorAction SilentlyContinue
+        if ($item -and $item.Length -ge $MaxBytes) {
+            Clear-Content -Path $Path -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 while ($true) {
+    Rotate-LogIfNeeded -Path $logFile -MaxBytes $maxLogSizeBytes -MaxBackups $maxLogBackups
+
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Add-Content -Path $logFile -Value "[$timestamp] Starting bot process"
 

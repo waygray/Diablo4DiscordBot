@@ -1,6 +1,7 @@
-﻿import os
+import os
 import re
 import json
+import tempfile
 from datetime import datetime, timezone, timedelta
 
 import aiohttp
@@ -10,6 +11,7 @@ from discord.ext import tasks, commands
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 if not TOKEN:
     raise RuntimeError("DISCORD_BOT_TOKEN is not set. Add it to your environment or bot.env.")
+DEBUG_ERRORS = os.getenv("BOT_DEBUG_ERRORS", "").strip().lower() in {"1", "true", "yes", "on"}
 
 SCHEDULE_API = "https://helltides.com/api/schedule"
 SUBSCRIPTIONS_FILE = "subscribers.json"
@@ -27,8 +29,11 @@ def load_subscriptions() -> dict:
     if not os.path.exists(SUBSCRIPTIONS_FILE):
         return {"guilds": {}}
 
-    with open(SUBSCRIPTIONS_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(SUBSCRIPTIONS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"guilds": {}}
 
     if isinstance(data, list):
         return {"guilds": {}}
@@ -36,12 +41,53 @@ def load_subscriptions() -> dict:
     if not isinstance(data, dict) or "guilds" not in data:
         return {"guilds": {}}
 
-    return data
+    guilds = data.get("guilds")
+    if not isinstance(guilds, dict):
+        return {"guilds": {}}
+
+    normalized: dict[str, dict] = {"guilds": {}}
+    for guild_id, cfg in guilds.items():
+        if not isinstance(guild_id, str) or not isinstance(cfg, dict):
+            continue
+        channel_id = cfg.get("channel_id")
+        if not isinstance(channel_id, int):
+            channel_id = None
+        subscribers = cfg.get("subscribers", [])
+        if not isinstance(subscribers, list):
+            subscribers = []
+        clean_subscribers = sorted(
+            {uid for uid in subscribers if isinstance(uid, int) and uid > 0}
+        )
+        normalized["guilds"][guild_id] = {
+            "channel_id": channel_id,
+            "subscribers": clean_subscribers,
+        }
+
+    return normalized
 
 
 def save_subscriptions() -> None:
-    with open(SUBSCRIPTIONS_FILE, "w", encoding="utf-8") as f:
-        json.dump(subscriptions, f, indent=2)
+    target_dir = os.path.abspath(os.path.dirname(SUBSCRIPTIONS_FILE) or ".")
+    fd, temp_path = tempfile.mkstemp(dir=target_dir)
+    try:
+        os.chmod(temp_path, 0o600)
+    except OSError:
+        pass
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
+            json.dump(subscriptions, temp_file, indent=2)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+    os.replace(temp_path, SUBSCRIPTIONS_FILE)
+    try:
+        os.chmod(SUBSCRIPTIONS_FILE, 0o600)
+    except OSError:
+        pass
 
 
 def get_guild_config(guild_id: int, create: bool = False) -> dict | None:
@@ -83,6 +129,28 @@ def _safe_parse_us_datetime(value: str) -> datetime | None:
         return None
 
 
+def _sanitize_external_text(value: str, max_len: int = 80) -> str:
+    if max_len <= 0:
+        return ""
+
+    cleaned = re.sub(r"[\x00-\x1f\x7f]", "", value or "").strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = discord.utils.escape_mentions(cleaned)
+    if len(cleaned) > max_len:
+        if max_len == 1:
+            return "…"
+        cleaned = cleaned[:max_len].rstrip()
+        cleaned = cleaned[:-1].rstrip() + "…"
+    return cleaned
+
+
+def _log_error(context: str, err: Exception) -> None:
+    if DEBUG_ERRORS:
+        print(f"[{context}] {type(err).__name__}: {err}", flush=True)
+    else:
+        print(f"[{context}] {type(err).__name__}", flush=True)
+
+
 def _parse_schedule_html(html: str, source: str) -> list[dict]:
     # Parse event rows from the rendered schedule list with icon + timestamp.
     item_pattern = re.compile(
@@ -111,7 +179,7 @@ def _parse_schedule_html(html: str, source: str) -> list[dict]:
             {
                 "id": _build_event_id(event_type, start),
                 "type": event_type,
-                "name": (match.group("name") or "").strip(),
+                "name": _sanitize_external_text(match.group("name") or ""),
                 "startTime": start,
                 "source": source,
             }
@@ -133,14 +201,14 @@ async def _fetch_helltides_api(session: aiohttp.ClientSession) -> list[dict]:
 
     events: list[dict] = []
     for event_type, entries in data.items():
-        label = labels.get(event_type, event_type.title())
+        label = _sanitize_external_text(labels.get(event_type, event_type.title()), max_len=40)
         for entry in entries:
             start = datetime.fromisoformat(entry["startTime"].replace("Z", "+00:00"))
             events.append(
                 {
                     "id": _build_event_id(label, start),
                     "type": label,
-                    "name": entry.get("boss") or entry.get("name") or "",
+                    "name": _sanitize_external_text(entry.get("boss") or entry.get("name") or ""),
                     "startTime": start,
                     "source": "helltides_api",
                 }
@@ -216,7 +284,7 @@ async def fetch_schedule() -> list[dict]:
                     active_sources.add(source_name)
                     source_events.extend(events)
             except Exception as e:
-                print(f"[fetch_schedule] {source_name} failed: {e}")
+                _log_error(f"fetch_schedule:{source_name}", e)
 
     if not source_events:
         return []
@@ -234,7 +302,7 @@ async def event_scanner() -> None:
     try:
         events = await fetch_schedule()
     except Exception as e:
-        print(f"[event_scanner] schedule fetch failed: {e}")
+        _log_error("event_scanner:schedule_fetch", e)
         return
 
     for event in events:
@@ -286,7 +354,7 @@ async def event_scanner() -> None:
                 await channel.send(msg)
                 alerted_keys.add(key)
             except discord.HTTPException as e:
-                print(f"[event_scanner] failed to send in guild {guild.id}: {e}")
+                _log_error(f"event_scanner:send:guild_{guild.id}", e)
 
 
 @bot.tree.command(name="signup", description="Subscribe to event pings in this server")
@@ -352,7 +420,7 @@ async def events(interaction: discord.Interaction) -> None:
     try:
         all_events = await fetch_schedule()
     except Exception as e:
-        print(f"[events] failed to fetch events: {e}")
+        _log_error("events:fetch_schedule", e)
         await interaction.response.send_message(
             "Failed to fetch events right now. Please try again shortly.",
             ephemeral=True,
@@ -397,8 +465,7 @@ async def on_ready() -> None:
     await bot.tree.sync()
     if not event_scanner.is_running():
         event_scanner.start()
-    guild_summary = ", ".join(f"{g.name}({g.id})" for g in bot.guilds) or "none"
-    print(f"{bot.user} is online in {len(bot.guilds)} server(s): {guild_summary}", flush=True)
+    print(f"{bot.user} is online in {len(bot.guilds)} server(s).", flush=True)
 
 
 bot.run(TOKEN)
