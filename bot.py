@@ -352,7 +352,11 @@ async def events(interaction: discord.Interaction) -> None:
     try:
         all_events = await fetch_schedule()
     except Exception as e:
-        await interaction.response.send_message(f"Failed to fetch events: {e}", ephemeral=True)
+        print(f"[events] failed to fetch events: {e}")
+        await interaction.response.send_message(
+            "Failed to fetch events right now. Please try again shortly.",
+            ephemeral=True,
+        )
         return
 
     now = datetime.now(timezone.utc)
