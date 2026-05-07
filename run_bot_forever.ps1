@@ -62,7 +62,15 @@ function Rotate-LogIfNeeded {
         }
     }
 
-    Move-Item -Path $Path -Destination "$Path.1" -Force
+    try {
+        Move-Item -Path $Path -Destination "$Path.1" -Force
+    }
+    catch {
+        $item = Get-Item $Path -ErrorAction SilentlyContinue
+        if ($item -and $item.Length -ge $MaxBytes) {
+            Clear-Content -Path $Path -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 while ($true) {

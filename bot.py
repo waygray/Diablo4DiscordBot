@@ -1,8 +1,8 @@
 import os
 import re
 import json
+import tempfile
 from datetime import datetime, timezone, timedelta
-from tempfile import NamedTemporaryFile
 
 import aiohttp
 import discord
@@ -67,9 +67,16 @@ def load_subscriptions() -> dict:
 
 
 def save_subscriptions() -> None:
-    with NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=".") as temp_file:
-        json.dump(subscriptions, temp_file, indent=2)
-        temp_path = temp_file.name
+    fd, temp_path = tempfile.mkstemp(dir=".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
+            json.dump(subscriptions, temp_file, indent=2)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
 
     os.replace(temp_path, SUBSCRIPTIONS_FILE)
     try:
@@ -120,7 +127,7 @@ def _safe_parse_us_datetime(value: str) -> datetime | None:
 def _sanitize_external_text(value: str, max_len: int = 80) -> str:
     cleaned = re.sub(r"[\x00-\x1f\x7f]", "", value or "").strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
-    cleaned = cleaned.replace("@", "@\u200b")
+    cleaned = discord.utils.escape_mentions(cleaned)
     if len(cleaned) > max_len:
         cleaned = cleaned[: max_len - 1].rstrip() + "…"
     return cleaned
