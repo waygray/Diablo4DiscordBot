@@ -9,6 +9,10 @@ $envFile = Join-Path $projectDir "bot.env"
 Set-Location $projectDir
 
 if (Test-Path $envFile) {
+    $allowedEnvVars = @(
+        "DISCORD_BOT_TOKEN"
+    )
+
     Get-Content $envFile | ForEach-Object {
         $line = $_.Trim()
         if (-not $line -or $line.StartsWith("#")) { return }
@@ -17,7 +21,9 @@ if (Test-Path $envFile) {
         if ($parts.Count -eq 2) {
             $name = $parts[0].Trim()
             $value = $parts[1].Trim()
-            [System.Environment]::SetEnvironmentVariable($name, $value, "Process")
+            if ($allowedEnvVars -contains $name) {
+                [System.Environment]::SetEnvironmentVariable($name, $value, "Process")
+            }
         }
     }
 }
