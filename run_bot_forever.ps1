@@ -5,15 +5,17 @@ $pythonExe = "C:\Users\waylo\OneDrive\Desktop\Diablo 4 Discord Bot\Diablo4Discor
 $botFile = Join-Path $projectDir "bot.py"
 $logFile = Join-Path $projectDir "bot_runner.log"
 $envFile = Join-Path $projectDir "bot.env"
-$maxLogSizeBytes = 5MB
-$maxLogBackups = 3
 
-Set-Location $projectDir
+function Write-RunnerLog {
+    param([string]$Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Add-Content -Path $logFile -Value "[$timestamp] $Message"
+}
 
-if (Test-Path $envFile) {
-    $allowedEnvVars = @(
-        "DISCORD_BOT_TOKEN"
-    )
+function Load-EnvFile {
+    if (-not (Test-Path $envFile)) {
+        return
+    }
 
     Get-Content $envFile | ForEach-Object {
         $line = $_.Trim()
@@ -23,12 +25,36 @@ if (Test-Path $envFile) {
         if ($parts.Count -eq 2) {
             $name = $parts[0].Trim()
             $value = $parts[1].Trim()
-            if ($allowedEnvVars -contains $name) {
-                [System.Environment]::SetEnvironmentVariable($name, $value, "Process")
-            }
+            [System.Environment]::SetEnvironmentVariable($name, $value, "Process")
         }
     }
 }
+
+function Get-WatchFingerprint {
+    $entries = Get-ChildItem -Path $projectDir -Recurse -File | Where-Object {
+        ($_.Extension -eq ".py") -or ($_.Extension -eq ".env") -or ($_.Name -eq "requirements.txt")
+    } | Sort-Object FullName | ForEach-Object {
+        "{0}|{1}|{2}" -f $_.FullName, $_.LastWriteTimeUtc.Ticks, $_.Length
+    }
+
+    if (-not $entries) {
+        return "no-files"
+    }
+
+    $raw = [string]::Join("`n", $entries)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($raw)
+        $hash = $sha.ComputeHash($bytes)
+        return [Convert]::ToBase64String($hash)
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+Set-Location $projectDir
+Load-EnvFile
 
 # Force a known-good CA bundle for Python HTTPS requests on this machine.
 try {
@@ -39,56 +65,48 @@ try {
     }
 }
 catch {
-    Add-Content -Path $logFile -Value "[$(Get-Date -Format \"yyyy-MM-dd HH:mm:ss\")] Warning: Could not set certifi CA bundle."
+    Write-RunnerLog "Warning: Could not set certifi CA bundle."
 }
 
-function Rotate-LogIfNeeded {
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][long]$MaxBytes,
-        [Parameter(Mandatory = $true)][int]$MaxBackups
-    )
+while ($true) {
+    $baselineFingerprint = Get-WatchFingerprint
+    Write-RunnerLog "Starting bot process"
 
-    if (-not (Test-Path $Path)) { return }
+    $botJob = Start-Job -ScriptBlock {
+        param($pythonExeArg, $botFileArg, $logFileArg, $projectDirArg)
+        Set-Location $projectDirArg
+        & $pythonExeArg $botFileArg 2>&1 | Tee-Object -FilePath $logFileArg -Append
+    } -ArgumentList $pythonExe, $botFile, $logFile, $projectDir
 
-    $item = Get-Item $Path -ErrorAction SilentlyContinue
-    if (-not $item -or $item.Length -lt $MaxBytes) { return }
+    $restartReason = "bot process exited"
 
-    $oldest = "$Path.$MaxBackups"
-    if (Test-Path $oldest) {
-        Remove-Item -Path $oldest -Force -ErrorAction SilentlyContinue
-    }
+    while ($true) {
+        Start-Sleep -Seconds 2
 
-    for ($i = $MaxBackups - 1; $i -ge 1; $i--) {
-        $src = "$Path.$i"
-        $dst = "$Path." + ($i + 1)
-        if (Test-Path $src) {
-            Move-Item -Path $src -Destination $dst -Force
+        if ($botJob.State -in @("Completed", "Failed", "Stopped")) {
+            break
+        }
+
+        $currentFingerprint = Get-WatchFingerprint
+        if ($currentFingerprint -ne $baselineFingerprint) {
+            $restartReason = "code/config change detected"
+            try {
+                Stop-Job -Id $botJob.Id -Force -ErrorAction SilentlyContinue
+            }
+            catch {
+            }
+            break
         }
     }
 
     try {
-        Move-Item -Path $Path -Destination "$Path.1" -Force
+        Receive-Job -Id $botJob.Id -ErrorAction SilentlyContinue | Out-Null
     }
     catch {
-        $item = Get-Item $Path -ErrorAction SilentlyContinue
-        if ($item -and $item.Length -ge $MaxBytes) {
-            Clear-Content -Path $Path -ErrorAction SilentlyContinue
-        }
     }
-}
 
-while ($true) {
-    Rotate-LogIfNeeded -Path $logFile -MaxBytes $maxLogSizeBytes -MaxBackups $maxLogBackups
+    Remove-Job -Id $botJob.Id -Force -ErrorAction SilentlyContinue
 
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Add-Content -Path $logFile -Value "[$timestamp] Starting bot process"
-
-    & $pythonExe $botFile 2>&1 | Tee-Object -FilePath $logFile -Append
-
-    $exitCode = $LASTEXITCODE
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Add-Content -Path $logFile -Value "[$timestamp] Bot exited with code $exitCode. Restarting in 5 seconds."
-
-    Start-Sleep -Seconds 5
+    Write-RunnerLog "Restarting because $restartReason."
+    Start-Sleep -Seconds 2
 }
