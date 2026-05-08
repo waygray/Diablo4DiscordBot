@@ -546,6 +546,8 @@ async def on_ready() -> None:
 # if the Discord bot crashes, and doesn't interfere with discord.py's event loop)
 # ---------------------------------------------------------------------------
 
+_last_error: str = "Starting..."
+
 def _build_status_html() -> str:
     is_ready = not bot.is_closed() and bot.user is not None
     bot_name = str(bot.user) if bot.user else "Not connected"
@@ -555,6 +557,11 @@ def _build_status_html() -> str:
     status_text = "Online" if is_ready else "Offline / Starting"
     status_icon = "&#x2705;" if is_ready else "&#x274C;"
     scanner_text = "Running" if event_scanner.is_running() else "Stopped"
+    error_row = "" if is_ready else f"""
+    <div class="row">
+      <span class="label">Last error</span>
+      <span class="value" style="color:#e74c3c;font-size:0.8rem;max-width:260px;word-break:break-word;text-align:right">{_last_error}</span>
+    </div>"""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -603,6 +610,7 @@ def _build_status_html() -> str:
       <span class="label">Scanner</span>
       <span class="value">{scanner_text}</span>
     </div>
+    {error_row}
   </div>
 </body>
 </html>"""
@@ -639,14 +647,17 @@ time.sleep(0.5)  # ensure health server is ready before bot connects
 delay = 30
 while True:
     try:
+        _last_error = "Connecting to Discord..."
         print("[bot] Connecting to Discord...", flush=True)
         bot.run(TOKEN)
         break  # clean shutdown
     except discord.LoginFailure as e:
-        print(f"[bot] LoginFailure (bad token): {e} — check DISCORD_BOT_TOKEN in Render env", flush=True)
+        _last_error = f"LoginFailure: bad token — update DISCORD_BOT_TOKEN in Render Environment"
+        print(f"[bot] {_last_error}", flush=True)
         time.sleep(300)
     except Exception as e:
-        print(f"[bot] {type(e).__name__}: {e} — retrying in {delay}s", flush=True)
+        _last_error = f"{type(e).__name__}: {e} (retrying in {delay}s)"
+        print(f"[bot] {_last_error}", flush=True)
         time.sleep(delay)
         delay = min(delay * 2, 300)
 
