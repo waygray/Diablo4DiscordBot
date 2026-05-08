@@ -627,12 +627,24 @@ async def _run_health_server() -> None:
 
 
 async def _run_bot() -> None:
-    """Run the Discord bot, logging errors without crashing the health server."""
-    try:
-        async with bot:
-            await bot.start(TOKEN)
-    except Exception as e:
-        print(f"[bot] {type(e).__name__}: {e}", flush=True)
+    """Run the Discord bot with exponential backoff, never crashing the health server."""
+    delay = 5
+    while True:
+        try:
+            async with bot:
+                await bot.start(TOKEN)
+        except discord.LoginFailure as e:
+            # Bad token — no point retrying rapidly.
+            print(f"[bot] LoginFailure (bad token?): {e}", flush=True)
+            await asyncio.sleep(60)
+        except Exception as e:
+            print(f"[bot] {type(e).__name__}: {e} — retrying in {delay}s", flush=True)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 300)  # cap at 5 minutes
+        else:
+            # Clean disconnect — wait briefly then reconnect.
+            delay = 5
+            await asyncio.sleep(5)
 
 
 async def main() -> None:
