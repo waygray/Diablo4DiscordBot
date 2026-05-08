@@ -1,12 +1,12 @@
 import os
 import re
 import json
-import asyncio
+import threading
 import tempfile
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone, timedelta
 
 import aiohttp
-from aiohttp import web
 import discord
 from discord.ext import tasks, commands
 
@@ -540,28 +540,22 @@ async def on_ready() -> None:
     print(f"{bot.user} is online in {len(bot.guilds)} server(s).", flush=True)
 
 
-# Minimal HTTP server so Render's free Web Service tier stays alive.
-# UptimeRobot (free) should ping /health every 5 minutes.
-async def _health(request: web.Request) -> web.Response:
-    return web.Response(text="ok")
+# ---------------------------------------------------------------------------
+# Health / status server (runs in a background thread so it stays up even
+# if the Discord bot crashes, and doesn't interfere with discord.py's event loop)
+# ---------------------------------------------------------------------------
 
-
-async def _status(request: web.Request) -> web.Response:
+def _build_status_html() -> str:
     is_ready = not bot.is_closed() and bot.user is not None
     bot_name = str(bot.user) if bot.user else "Not connected"
     guild_count = len(bot.guilds)
     db_status = "Configured" if DATABASE_URL else "Not configured (using local file)"
+    status_color = "#2ecc71" if is_ready else "#e74c3c"
+    status_text = "Online" if is_ready else "Offline / Starting"
+    status_icon = "&#x2705;" if is_ready else "&#x274C;"
+    scanner_text = "Running" if event_scanner.is_running() else "Stopped"
 
-    if is_ready:
-        status_color = "#2ecc71"
-        status_text = "Online"
-        status_icon = "✅"
-    else:
-        status_color = "#e74c3c"
-        status_text = "Offline / Starting"
-        status_icon = "❌"
-
-    html = f"""<!DOCTYPE html>
+    return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -586,7 +580,7 @@ async def _status(request: web.Request) -> web.Response:
 </head>
 <body>
   <div class="card">
-    <h1>⚔️ Diablo 4 Discord Bot</h1>
+    <h1>&#x2694;&#xFE0F; Diablo 4 Discord Bot</h1>
     <div class="subtitle">Live status dashboard</div>
     <div class="row">
       <span class="label">Status</span>
@@ -606,53 +600,40 @@ async def _status(request: web.Request) -> web.Response:
     </div>
     <div class="row">
       <span class="label">Scanner</span>
-      <span class="value">{"Running" if event_scanner.is_running() else "Stopped"}</span>
+      <span class="value">{scanner_text}</span>
     </div>
   </div>
 </body>
 </html>"""
-    return web.Response(text=html, content_type="text/html")
 
 
-async def _run_health_server() -> None:
-    port = int(os.getenv("PORT", "8080"))
-    app = web.Application()
-    app.router.add_get("/health", _health)
-    app.router.add_get("/", _status)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"Health server listening on port {port}", flush=True)
-
-
-async def _run_bot() -> None:
-    """Run the Discord bot with exponential backoff, never crashing the health server."""
-    delay = 5
-    while True:
-        try:
-            async with bot:
-                await bot.start(TOKEN)
-        except discord.LoginFailure as e:
-            # Bad token — no point retrying rapidly.
-            print(f"[bot] LoginFailure (bad token?): {e}", flush=True)
-            await asyncio.sleep(60)
-        except Exception as e:
-            print(f"[bot] {type(e).__name__}: {e} — retrying in {delay}s", flush=True)
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 300)  # cap at 5 minutes
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path == "/health":
+            body = b"ok"
+            content_type = "text/plain"
         else:
-            # Clean disconnect — wait briefly then reconnect.
-            delay = 5
-            await asyncio.sleep(5)
+            body = _build_status_html().encode("utf-8")
+            content_type = "text/html; charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args) -> None:
+        pass  # suppress access logs
 
 
-async def main() -> None:
-    await _run_health_server()
-    # Run bot as a background task so a crash doesn't kill the health server.
-    asyncio.create_task(_run_bot())
-    # Keep the event loop alive forever.
-    await asyncio.Event().wait()
+def _start_health_thread() -> None:
+    port = int(os.getenv("PORT", "8080"))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    print(f"Health server listening on port {port}", flush=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
-asyncio.run(main())
+_start_health_thread()
+bot.run(TOKEN)
+
+
+
