@@ -633,7 +633,11 @@ def _start_health_thread() -> None:
 
 
 _start_health_thread()
-bot.run(TOKEN)
+try:
+    bot.run(TOKEN)
+except Exception as e:
+    print(f"[bot] Fatal: {type(e).__name__}: {e}", flush=True)
+    raise
 
 
 
