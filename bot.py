@@ -667,6 +667,17 @@ async def _bot_loop() -> None:
                 pass
             await asyncio.sleep(300)
         except Exception as e:
+            # 429 from Cloudflare means the IP is banned — stop hammering it.
+            if "429" in str(e) or "Too Many Requests" in str(e):
+                wait = 1800  # 30 minutes
+                _last_error = f"IP rate-limited by Discord/Cloudflare — waiting {wait//60} min before retry"
+                print(f"[bot] {_last_error}", flush=True)
+                try:
+                    await bot.close()
+                except Exception:
+                    pass
+                await asyncio.sleep(wait)
+                continue
             _last_error = f"{type(e).__name__}: {e} (retrying in {delay}s)"
             print(f"[bot] {_last_error}", flush=True)
             try:
