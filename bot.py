@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import threading
 import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -633,11 +634,22 @@ def _start_health_thread() -> None:
 
 
 _start_health_thread()
-try:
-    bot.run(TOKEN)
-except Exception as e:
-    print(f"[bot] Fatal: {type(e).__name__}: {e}", flush=True)
-    raise
+time.sleep(0.5)  # ensure health server is ready before bot connects
+
+delay = 30
+while True:
+    try:
+        print("[bot] Connecting to Discord...", flush=True)
+        bot.run(TOKEN)
+        break  # clean shutdown
+    except discord.LoginFailure as e:
+        print(f"[bot] LoginFailure (bad token): {e} — check DISCORD_BOT_TOKEN in Render env", flush=True)
+        time.sleep(300)
+    except Exception as e:
+        print(f"[bot] {type(e).__name__}: {e} — retrying in {delay}s", flush=True)
+        time.sleep(delay)
+        delay = min(delay * 2, 300)
+
 
 
 
