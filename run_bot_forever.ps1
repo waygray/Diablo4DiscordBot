@@ -69,44 +69,13 @@ catch {
 }
 
 while ($true) {
-    $baselineFingerprint = Get-WatchFingerprint
     Write-RunnerLog "Starting bot process"
 
-    $botJob = Start-Job -ScriptBlock {
-        param($pythonExeArg, $botFileArg, $logFileArg, $projectDirArg)
-        Set-Location $projectDirArg
-        & $pythonExeArg $botFileArg 2>&1 | Tee-Object -FilePath $logFileArg -Append
-    } -ArgumentList $pythonExe, $botFile, $logFile, $projectDir
+    # Run Python directly, redirecting all output to the log file.
+    # This call blocks until Python exits, keeping the scheduled task Running.
+    & $pythonExe $botFile *>> $logFile
 
-    $restartReason = "bot process exited"
-
-    while ($true) {
-        Start-Sleep -Seconds 2
-
-        if ($botJob.State -in @("Completed", "Failed", "Stopped")) {
-            break
-        }
-
-        $currentFingerprint = Get-WatchFingerprint
-        if ($currentFingerprint -ne $baselineFingerprint) {
-            $restartReason = "code/config change detected"
-            try {
-                Stop-Job -Id $botJob.Id -Force -ErrorAction SilentlyContinue
-            }
-            catch {
-            }
-            break
-        }
-    }
-
-    try {
-        Receive-Job -Id $botJob.Id -ErrorAction SilentlyContinue | Out-Null
-    }
-    catch {
-    }
-
-    Remove-Job -Id $botJob.Id -Force -ErrorAction SilentlyContinue
-
-    Write-RunnerLog "Restarting because $restartReason."
-    Start-Sleep -Seconds 2
+    $exitCode = $LASTEXITCODE
+    Write-RunnerLog "Bot exited (code $exitCode). Restarting in 5 seconds..."
+    Start-Sleep -Seconds 5
 }

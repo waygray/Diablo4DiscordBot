@@ -1,0 +1,19 @@
+services:
+  - type: worker
+    name: diablo4-discord-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false          # you set this manually in the Render dashboard
+      - key: DATABASE_URL
+        fromDatabase:
+          name: diablo4-bot-db
+          property: connectionString
+
+databases:
+  - name: diablo4-bot-db
+    databaseName: diablo4bot
+    user: diablo4bot
+    plan: free

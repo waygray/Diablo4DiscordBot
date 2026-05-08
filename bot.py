@@ -8,14 +8,23 @@ import aiohttp
 import discord
 from discord.ext import tasks, commands
 
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
+
 TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 if not TOKEN:
     raise RuntimeError("DISCORD_BOT_TOKEN is not set. Add it to your environment or bot.env.")
 DEBUG_ERRORS = os.getenv("BOT_DEBUG_ERRORS", "").strip().lower() in {"1", "true", "yes", "on"}
 
 SCHEDULE_API = "https://helltides.com/api/schedule"
-SUBSCRIPTIONS_FILE = "subscribers.json"
+SUBSCRIPTIONS_FILE = os.getenv("SUBSCRIPTIONS_FILE", "subscribers.json")
 WARN_MINUTES = 15
+
+_raw_db_url = os.getenv("DATABASE_URL", "").strip()
+# psycopg2 requires 'postgresql://' scheme; Railway/Render may emit 'postgres://'
+DATABASE_URL = _raw_db_url.replace("postgres://", "postgresql://", 1) if _raw_db_url.startswith("postgres://") else _raw_db_url
 
 intents = discord.Intents.default()
 intents.voice_states = True
@@ -25,26 +34,69 @@ intents.message_content = False
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
 
 
-def load_subscriptions() -> dict:
-    if not os.path.exists(SUBSCRIPTIONS_FILE):
-        return {"guilds": {}}
+def _db_connect():
+    """Open a new psycopg2 connection using DATABASE_URL."""
+    return psycopg2.connect(DATABASE_URL)
 
+
+def _db_ensure_table(cur) -> None:
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS guild_configs (
+            guild_id   TEXT PRIMARY KEY,
+            channel_id BIGINT,
+            subscribers BIGINT[]
+        )
+    """)
+
+
+def _db_load_subscriptions() -> dict:
     try:
-        with open(SUBSCRIPTIONS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+        conn = _db_connect()
+        try:
+            with conn.cursor() as cur:
+                _db_ensure_table(cur)
+                conn.commit()
+                cur.execute("SELECT guild_id, channel_id, subscribers FROM guild_configs")
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[load_subscriptions:db] {type(e).__name__}: {e}", flush=True)
         return {"guilds": {}}
 
-    if isinstance(data, list):
-        return {"guilds": {}}
+    normalized: dict[str, dict] = {"guilds": {}}
+    for guild_id, channel_id, subscribers in rows:
+        normalized["guilds"][guild_id] = {
+            "channel_id": channel_id,
+            "subscribers": sorted(subscribers or []),
+        }
+    return normalized
 
+
+def _db_save_subscriptions() -> None:
+    conn = _db_connect()
+    try:
+        with conn.cursor() as cur:
+            _db_ensure_table(cur)
+            for guild_id, cfg in subscriptions.get("guilds", {}).items():
+                cur.execute("""
+                    INSERT INTO guild_configs (guild_id, channel_id, subscribers)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (guild_id) DO UPDATE
+                        SET channel_id  = EXCLUDED.channel_id,
+                            subscribers = EXCLUDED.subscribers
+                """, (guild_id, cfg.get("channel_id"), cfg.get("subscribers", [])))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _normalize_json_subscriptions(data) -> dict:
     if not isinstance(data, dict) or "guilds" not in data:
         return {"guilds": {}}
-
     guilds = data.get("guilds")
     if not isinstance(guilds, dict):
         return {"guilds": {}}
-
     normalized: dict[str, dict] = {"guilds": {}}
     for guild_id, cfg in guilds.items():
         if not isinstance(guild_id, str) or not isinstance(cfg, dict):
@@ -62,11 +114,30 @@ def load_subscriptions() -> dict:
             "channel_id": channel_id,
             "subscribers": clean_subscribers,
         }
-
     return normalized
 
 
+def load_subscriptions() -> dict:
+    if DATABASE_URL and psycopg2:
+        return _db_load_subscriptions()
+
+    if not os.path.exists(SUBSCRIPTIONS_FILE):
+        return {"guilds": {}}
+    try:
+        with open(SUBSCRIPTIONS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"guilds": {}}
+    if isinstance(data, list):
+        return {"guilds": {}}
+    return _normalize_json_subscriptions(data)
+
+
 def save_subscriptions() -> None:
+    if DATABASE_URL and psycopg2:
+        _db_save_subscriptions()
+        return
+
     target_dir = os.path.abspath(os.path.dirname(SUBSCRIPTIONS_FILE) or ".")
     fd, temp_path = tempfile.mkstemp(dir=target_dir)
     try:
@@ -82,7 +153,6 @@ def save_subscriptions() -> None:
         except OSError:
             pass
         raise
-
     os.replace(temp_path, SUBSCRIPTIONS_FILE)
     try:
         os.chmod(SUBSCRIPTIONS_FILE, 0o600)
