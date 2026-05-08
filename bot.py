@@ -626,10 +626,21 @@ async def _run_health_server() -> None:
     print(f"Health server listening on port {port}", flush=True)
 
 
+async def _run_bot() -> None:
+    """Run the Discord bot, logging errors without crashing the health server."""
+    try:
+        async with bot:
+            await bot.start(TOKEN)
+    except Exception as e:
+        print(f"[bot] {type(e).__name__}: {e}", flush=True)
+
+
 async def main() -> None:
     await _run_health_server()
-    async with bot:
-        await bot.start(TOKEN)
+    # Run bot as a background task so a crash doesn't kill the health server.
+    asyncio.create_task(_run_bot())
+    # Keep the event loop alive forever.
+    await asyncio.Event().wait()
 
 
 asyncio.run(main())
