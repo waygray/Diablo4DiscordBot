@@ -1,9 +1,11 @@
 services:
-  - type: worker
+  - type: web
     name: diablo4-discord-bot
     runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
+    healthCheckPath: /health
     envVars:
       - key: DISCORD_BOT_TOKEN
         sync: false          # you set this manually in the Render dashboard

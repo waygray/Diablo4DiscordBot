@@ -1,10 +1,12 @@
 import os
 import re
 import json
+import asyncio
 import tempfile
 from datetime import datetime, timezone, timedelta
 
 import aiohttp
+from aiohttp import web
 import discord
 from discord.ext import tasks, commands
 
@@ -538,4 +540,28 @@ async def on_ready() -> None:
     print(f"{bot.user} is online in {len(bot.guilds)} server(s).", flush=True)
 
 
-bot.run(TOKEN)
+# Minimal HTTP server so Render's free Web Service tier stays alive.
+# UptimeRobot (free) should ping /health every 5 minutes.
+async def _health(request: web.Request) -> web.Response:
+    return web.Response(text="ok")
+
+
+async def _run_health_server() -> None:
+    port = int(os.getenv("PORT", "8080"))
+    app = web.Application()
+    app.router.add_get("/health", _health)
+    app.router.add_get("/", _health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Health server listening on port {port}", flush=True)
+
+
+async def main() -> None:
+    await _run_health_server()
+    async with bot:
+        await bot.start(TOKEN)
+
+
+asyncio.run(main())
