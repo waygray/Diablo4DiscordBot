@@ -546,11 +546,79 @@ async def _health(request: web.Request) -> web.Response:
     return web.Response(text="ok")
 
 
+async def _status(request: web.Request) -> web.Response:
+    is_ready = not bot.is_closed() and bot.user is not None
+    bot_name = str(bot.user) if bot.user else "Not connected"
+    guild_count = len(bot.guilds)
+    db_status = "Configured" if DATABASE_URL else "Not configured (using local file)"
+
+    if is_ready:
+        status_color = "#2ecc71"
+        status_text = "Online"
+        status_icon = "✅"
+    else:
+        status_color = "#e74c3c"
+        status_text = "Offline / Starting"
+        status_icon = "❌"
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Diablo 4 Bot Status</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+           background: #1a1a2e; color: #eee; display: flex; justify-content: center;
+           align-items: center; min-height: 100vh; margin: 0; }}
+    .card {{ background: #16213e; border-radius: 12px; padding: 40px 50px;
+             box-shadow: 0 8px 32px rgba(0,0,0,0.4); max-width: 420px; width: 100%; }}
+    h1 {{ margin: 0 0 8px; font-size: 1.5rem; color: #c0392b; }}
+    .subtitle {{ color: #888; font-size: 0.9rem; margin-bottom: 30px; }}
+    .row {{ display: flex; justify-content: space-between; padding: 12px 0;
+            border-bottom: 1px solid #0f3460; font-size: 0.95rem; }}
+    .row:last-child {{ border-bottom: none; }}
+    .label {{ color: #aaa; }}
+    .value {{ font-weight: 600; }}
+    .badge {{ background: {status_color}22; color: {status_color};
+              padding: 3px 10px; border-radius: 20px; font-size: 0.85rem; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>⚔️ Diablo 4 Discord Bot</h1>
+    <div class="subtitle">Live status dashboard</div>
+    <div class="row">
+      <span class="label">Status</span>
+      <span class="badge">{status_icon} {status_text}</span>
+    </div>
+    <div class="row">
+      <span class="label">Bot account</span>
+      <span class="value">{bot_name}</span>
+    </div>
+    <div class="row">
+      <span class="label">Servers</span>
+      <span class="value">{guild_count}</span>
+    </div>
+    <div class="row">
+      <span class="label">Database</span>
+      <span class="value">{db_status}</span>
+    </div>
+    <div class="row">
+      <span class="label">Scanner</span>
+      <span class="value">{"Running" if event_scanner.is_running() else "Stopped"}</span>
+    </div>
+  </div>
+</body>
+</html>"""
+    return web.Response(text=html, content_type="text/html")
+
+
 async def _run_health_server() -> None:
     port = int(os.getenv("PORT", "8080"))
     app = web.Application()
     app.router.add_get("/health", _health)
-    app.router.add_get("/", _health)
+    app.router.add_get("/", _status)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
