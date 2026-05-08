@@ -8,14 +8,6 @@ services:
     healthCheckPath: /health
     envVars:
       - key: DISCORD_BOT_TOKEN
-        sync: false          # you set this manually in the Render dashboard
+        sync: false   # set manually in the Render dashboard
       - key: DATABASE_URL
-        fromDatabase:
-          name: diablo4-bot-db
-          property: connectionString
-
-databases:
-  - name: diablo4-bot-db
-    databaseName: diablo4bot
-    user: diablo4bot
-    plan: free
+        sync: false   # paste your Supabase connection string in the Render dashboard
