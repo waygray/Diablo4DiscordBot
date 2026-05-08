@@ -1,7 +1,7 @@
 import os
 import re
 import json
-import time
+import asyncio
 import threading
 import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -642,24 +642,42 @@ def _start_health_thread() -> None:
 
 
 _start_health_thread()
-time.sleep(0.5)  # ensure health server is ready before bot connects
 
-delay = 30
-while True:
-    try:
-        _last_error = "Connecting to Discord..."
-        print("[bot] Connecting to Discord...", flush=True)
-        bot.run(TOKEN)
-        break  # clean shutdown
-    except discord.LoginFailure as e:
-        _last_error = f"LoginFailure: bad token — update DISCORD_BOT_TOKEN in Render Environment"
-        print(f"[bot] {_last_error}", flush=True)
-        time.sleep(300)
-    except Exception as e:
-        _last_error = f"{type(e).__name__}: {e} (retrying in {delay}s)"
-        print(f"[bot] {_last_error}", flush=True)
-        time.sleep(delay)
-        delay = min(delay * 2, 300)
+
+async def _bot_loop() -> None:
+    global _last_error
+    delay = 30
+    while True:
+        try:
+            _last_error = "Connecting to Discord..."
+            print("[bot] Connecting to Discord...", flush=True)
+            # Reset internal state so a fresh aiohttp session is created each attempt.
+            # bot.run() closes the connector on exit; bot.start() won't reopen a closed one
+            # unless we clear it here.
+            bot._closed = False
+            bot.http.connector = discord.utils.MISSING
+            await bot.start(TOKEN)
+            break  # clean shutdown
+        except discord.LoginFailure as e:
+            _last_error = "LoginFailure: bad token \u2014 update DISCORD_BOT_TOKEN in Render Environment"
+            print(f"[bot] {_last_error}", flush=True)
+            try:
+                await bot.close()
+            except Exception:
+                pass
+            await asyncio.sleep(300)
+        except Exception as e:
+            _last_error = f"{type(e).__name__}: {e} (retrying in {delay}s)"
+            print(f"[bot] {_last_error}", flush=True)
+            try:
+                await bot.close()
+            except Exception:
+                pass
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 300)
+
+
+asyncio.run(_bot_loop())
 
 
 
