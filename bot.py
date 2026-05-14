@@ -372,6 +372,11 @@ async def event_scanner() -> None:
     start_window = now + timedelta(minutes=WARN_MINUTES - 1)
     end_window = now + timedelta(minutes=WARN_MINUTES + 1)
 
+    # Drop alert keys for events more than 2 hours in the past to prevent unbounded growth.
+    cutoff_ts = (now - timedelta(hours=2)).timestamp()
+    stale = {key for key in alerted_keys if key[0] // 10 < cutoff_ts}
+    alerted_keys.difference_update(stale)
+
     try:
         events = await fetch_schedule()
     except Exception as e:
@@ -648,6 +653,7 @@ async def _bot_loop() -> None:
     global _last_error
     delay = 30
     while True:
+        connect_time = asyncio.get_event_loop().time()
         try:
             _last_error = "Connecting to Discord..."
             print("[bot] Connecting to Discord...", flush=True)
@@ -659,7 +665,7 @@ async def _bot_loop() -> None:
             await bot.start(TOKEN)
             break  # clean shutdown
         except discord.LoginFailure as e:
-            _last_error = "LoginFailure: bad token \u2014 update DISCORD_BOT_TOKEN in Render Environment"
+            _last_error = "LoginFailure: bad token — update DISCORD_BOT_TOKEN in bot.env"
             print(f"[bot] {_last_error}", flush=True)
             try:
                 await bot.close()
@@ -677,7 +683,11 @@ async def _bot_loop() -> None:
                 except Exception:
                     pass
                 await asyncio.sleep(wait)
+                delay = 30  # reset backoff after long rate-limit pause
                 continue
+            # If we stayed connected for at least 60 s before crashing, reset backoff.
+            if asyncio.get_event_loop().time() - connect_time > 60:
+                delay = 30
             _last_error = f"{type(e).__name__}: {e} (retrying in {delay}s)"
             print(f"[bot] {_last_error}", flush=True)
             try:
@@ -689,7 +699,3 @@ async def _bot_loop() -> None:
 
 
 asyncio.run(_bot_loop())
-
-
-
-
