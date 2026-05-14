@@ -3,7 +3,7 @@ import re
 import json
 import asyncio
 import threading
-import html
+import html as _html
 import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone, timedelta
@@ -176,6 +176,7 @@ def get_guild_config(guild_id: int, create: bool = False) -> dict | None:
 
 subscriptions = load_subscriptions()
 alerted_keys: set[tuple[int, int]] = set()
+_cached_events: list = []  # updated by event_scanner every minute; read by status page
 
 
 HELLTIDES_SCHEDULE_PAGE = "https://helltides.com/schedule"
@@ -225,8 +226,7 @@ def _log_error(context: str, err: Exception) -> None:
         print(f"[{context}] {type(err).__name__}", flush=True)
 
 
-def _parse_schedule_html(html: str, source: str) -> list[dict]:
-    # Parse event rows from the rendered schedule list with icon + timestamp.
+def _parse_schedule_html(html_text: str, source: str) -> list[dict]:
     item_pattern = re.compile(
         r"<li[^>]*>\s*<img[^>]*?/images/icons/(?P<icon>[a-z_]+)\.png[^>]*>\s*"
         r"<span>(?P<dt>\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}:\d{2}\s+[AP]M)</span>"
@@ -240,7 +240,7 @@ def _parse_schedule_html(html: str, source: str) -> list[dict]:
     }
 
     events: list[dict] = []
-    for match in item_pattern.finditer(html):
+    for match in item_pattern.finditer(html_text):
         event_type = icon_map.get(match.group("icon").lower())
         if not event_type:
             continue
@@ -294,16 +294,15 @@ async def _fetch_helltides_api(session: aiohttp.ClientSession) -> list[dict]:
 async def _fetch_helltides_schedule_page(session: aiohttp.ClientSession) -> list[dict]:
     async with session.get(HELLTIDES_SCHEDULE_PAGE) as resp:
         resp.raise_for_status()
-        html = await resp.text()
-    return _parse_schedule_html(html, "helltides_schedule_page")
+        html_text = await resp.text()
+    return _parse_schedule_html(html_text, "helltides_schedule_page")
 
 
 async def _fetch_d4life_tracker_page(session: aiohttp.ClientSession) -> list[dict]:
-    # Best-effort scrape: this site may not always expose structured timestamps.
     async with session.get(D4LIFE_TRACKER_PAGE) as resp:
         resp.raise_for_status()
-        html = await resp.text()
-    return _parse_schedule_html(html, "d4life_tracker")
+        html_text = await resp.text()
+    return _parse_schedule_html(html_text, "d4life_tracker")
 
 
 def _merge_events_by_consensus(events: list[dict], active_sources: set[str]) -> list[dict]:
@@ -317,11 +316,7 @@ def _merge_events_by_consensus(events: list[dict], active_sources: set[str]) -> 
     merged: list[dict] = []
 
     for _, candidates in grouped.items():
-        # Prefer candidate backed by the most distinct sources; never discard.
         source_set = {c.get("source", "unknown") for c in candidates}
-
-        # Pick the candidate whose source is "helltides_api" if available,
-        # otherwise just take the first by start time.
         api_candidates = [c for c in candidates if c.get("source") == "helltides_api"]
         best = (api_candidates or sorted(candidates, key=lambda c: c["startTime"]))[0]
 
@@ -369,15 +364,27 @@ async def fetch_schedule() -> list[dict]:
 
 @tasks.loop(minutes=1)
 async def event_scanner() -> None:
+    global _cached_events
     now = datetime.now(timezone.utc)
     start_window = now + timedelta(minutes=WARN_MINUTES - 1)
     end_window = now + timedelta(minutes=WARN_MINUTES + 1)
+
+    # Prune alert keys for events more than 2 hours old.
+    cutoff_ts = (now - timedelta(hours=2)).timestamp()
+    stale = {key for key in alerted_keys if key[0] // 10 < cutoff_ts}
+    alerted_keys.difference_update(stale)
 
     try:
         events = await fetch_schedule()
     except Exception as e:
         _log_error("event_scanner:schedule_fetch", e)
         return
+
+    # Cache upcoming events for the status page (safe: simple reference reassignment).
+    _cached_events = sorted(
+        [e for e in events if e["startTime"] > now],
+        key=lambda e: e["startTime"],
+    )
 
     for event in events:
         if not (start_window <= event["startTime"] <= end_window):
@@ -543,30 +550,79 @@ async def on_ready() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Health / status server (runs in a background thread so it stays up even
-# if the Discord bot crashes, and doesn't interfere with discord.py's event loop)
+# Health / status web server
+# Runs in a background thread — stays up even if the Discord bot crashes,
+# never blocks the asyncio event loop, and is reachable by UptimeRobot.
 # ---------------------------------------------------------------------------
 
 _last_error: str = "Starting..."
 
+
+def _rel_time(dt: datetime) -> str:
+    """Return a human-readable relative time string like 'in 14m 30s'."""
+    secs = int((dt - datetime.now(timezone.utc)).total_seconds())
+    if secs <= 0:
+        return "starting now"
+    if secs < 60:
+        return f"in {secs}s"
+    if secs < 3600:
+        m, s = divmod(secs, 60)
+        return f"in {m}m {s}s" if s else f"in {m}m"
+    h, rem = divmod(secs, 3600)
+    m = rem // 60
+    return f"in {h}h {m}m" if m else f"in {h}h"
+
+
+def _build_events_html() -> str:
+    now = datetime.now(timezone.utc)
+    upcoming = [e for e in _cached_events if e["startTime"] > now]
+
+    first_per_type: dict[str, dict] = {}
+    for e in upcoming:
+        if e["type"] not in first_per_type:
+            first_per_type[e["type"]] = e
+
+    if not first_per_type:
+        return '<p class="no-events">No events cached yet &mdash; scanner updates every minute</p>'
+
+    icons = {"World Boss": "&#x1F479;", "Helltide": "&#x1F525;", "Legion Event": "&#x2694;&#xFE0F;"}
+    rows = []
+    for t in EVENT_TYPE_ORDER:
+        ev = first_per_type.get(t)
+        if not ev:
+            continue
+        rel = _rel_time(ev["startTime"])
+        abs_t = ev["startTime"].strftime("%H:%M UTC")
+        name_html = (
+            f' <span class="ev-name">&middot; {_html.escape(ev["name"])}</span>'
+            if ev.get("name") else ""
+        )
+        secs_away = int((ev["startTime"] - now).total_seconds())
+        row_cls = "ev-row ev-urgent" if secs_away < 900 else "ev-row"
+        rows.append(
+            f'<div class="{row_cls}">'
+            f'<span class="ev-type">{icons.get(t, "&#x1F4C5;")} {_html.escape(t)}{name_html}</span>'
+            f'<span class="ev-time">{rel} &nbsp;&bull;&nbsp; {abs_t}</span>'
+            f'</div>'
+        )
+    return "\n".join(rows)
+
+
 def _build_status_html() -> str:
     is_ready = not bot.is_closed() and bot.user is not None
-    bot_name = html.escape(str(bot.user) if bot.user else "Not connected")
+    bot_name = _html.escape(str(bot.user) if bot.user else "Not connected")
     guild_count = len(bot.guilds)
-    db_status = "Configured (PostgreSQL)" if DATABASE_URL else "Local file"
-    status_color = "#2ecc71" if is_ready else "#e74c3c"
+    db_status = "PostgreSQL" if DATABASE_URL else "Local JSON"
     status_text = "Online" if is_ready else "Offline / Starting"
-    status_icon = "&#x2705;" if is_ready else "&#x274C;"
     scanner_text = "Running" if event_scanner.is_running() else "Stopped"
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    r, g, b = int(status_color[1:3], 16), int(status_color[3:5], 16), int(status_color[5:7], 16)
-    badge_bg = f"rgba({r},{g},{b},0.13)"
-    badge_border = f"rgba({r},{g},{b},0.30)"
+    status_cls = "online" if is_ready else "offline"
     error_row = "" if is_ready else f"""
     <div class="row">
-      <span class="label">Last error</span>
-      <span class="err">{html.escape(_last_error)}</span>
+      <span class="lbl">Last error</span>
+      <span class="val err">{_html.escape(_last_error)}</span>
     </div>"""
+    events_html = _build_events_html()
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -574,41 +630,101 @@ def _build_status_html() -> str:
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="refresh" content="30">
-  <title>Diablo 4 Bot Status</title>
+  <title>Diablo 4 Bot</title>
   <style>
+    :root{{
+      --bg:#0a0a12;--card:#11111e;--border:#1c1c30;
+      --red:#c0392b;--green:#27ae60;--orange:#e67e22;
+      --text:#e6e4f0;--muted:#52506a;--blue:#7ec8e3;
+    }}
     *{{box-sizing:border-box;margin:0;padding:0}}
-    body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-         background:#1a1a2e;color:#eee;display:flex;flex-direction:column;
-         justify-content:center;align-items:center;min-height:100vh;gap:14px}}
-    .card{{background:#16213e;border-radius:12px;padding:36px 44px;
-           box-shadow:0 8px 32px rgba(0,0,0,.5);max-width:440px;width:90%}}
-    h1{{font-size:1.4rem;color:#c0392b;margin-bottom:4px}}
-    .sub{{color:#555;font-size:.82rem;margin-bottom:26px}}
-    .row{{display:flex;justify-content:space-between;align-items:center;
-          padding:11px 0;border-bottom:1px solid #0f3460;font-size:.9rem;gap:12px}}
+    body{{
+      font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+      background:var(--bg);color:var(--text);min-height:100vh;
+      display:flex;flex-direction:column;align-items:center;
+      padding:36px 16px 52px;gap:16px;
+    }}
+    header{{text-align:center}}
+    header h1{{
+      font-size:1.55rem;color:var(--red);letter-spacing:-.02em;
+      text-shadow:0 0 40px rgba(192,57,43,.4);
+    }}
+    header p{{color:var(--muted);font-size:.78rem;margin-top:5px}}
+    .card{{
+      background:var(--card);border:1px solid var(--border);
+      border-radius:10px;padding:20px 24px;width:100%;max-width:460px;
+    }}
+    .card-label{{
+      font-size:.62rem;text-transform:uppercase;letter-spacing:.14em;
+      color:var(--muted);padding-bottom:12px;margin-bottom:12px;
+      border-bottom:1px solid var(--border);
+    }}
+    .row{{
+      display:flex;justify-content:space-between;align-items:center;
+      padding:8px 0;border-bottom:1px solid var(--border);
+      font-size:.875rem;gap:8px;
+    }}
     .row:last-child{{border-bottom:none}}
-    .lbl{{color:#888;white-space:nowrap}}
-    .val{{font-weight:600;text-align:right}}
-    .badge{{background:{badge_bg};color:{status_color};
-            padding:3px 12px;border-radius:20px;font-size:.82rem;
-            font-weight:600;border:1px solid {badge_border}}}
-    .err{{color:#e74c3c;font-size:.78rem;max-width:230px;
-          word-break:break-word;text-align:right}}
-    .ts{{color:#444;font-size:.78rem;text-align:right}}
-    footer{{font-size:.72rem;color:#333}}
-    code{{background:#0f3460;padding:1px 5px;border-radius:4px;color:#7ec8e3}}
+    .lbl{{color:var(--muted);white-space:nowrap;flex-shrink:0}}
+    .val{{font-weight:600;text-align:right;word-break:break-word}}
+    .val.err{{
+      color:#e74c3c;font-size:.77rem;font-weight:400;
+      max-width:240px;line-height:1.4;
+    }}
+    .val.ts{{color:var(--muted);font-size:.78rem;font-weight:400}}
+    .badge{{
+      display:inline-flex;align-items:center;gap:7px;
+      padding:3px 12px;border-radius:20px;font-size:.77rem;font-weight:700;
+    }}
+    .badge::before{{
+      content:'';width:7px;height:7px;border-radius:50%;flex-shrink:0;
+    }}
+    .badge.online{{
+      background:rgba(39,174,96,.12);color:var(--green);
+      border:1px solid rgba(39,174,96,.22);
+    }}
+    .badge.online::before{{background:var(--green);box-shadow:0 0 6px var(--green)}}
+    .badge.offline{{
+      background:rgba(192,57,43,.12);color:#e74c3c;
+      border:1px solid rgba(192,57,43,.22);
+    }}
+    .badge.offline::before{{background:#e74c3c}}
+    .ev-row{{
+      display:flex;justify-content:space-between;align-items:center;
+      padding:9px 10px;border-radius:7px;font-size:.85rem;
+      gap:10px;transition:background .15s;
+    }}
+    .ev-row+.ev-row{{margin-top:3px}}
+    .ev-row:hover{{background:rgba(255,255,255,.03)}}
+    .ev-type{{font-weight:600}}
+    .ev-name{{font-weight:400;color:var(--muted);font-size:.8rem}}
+    .ev-time{{
+      color:var(--muted);font-size:.8rem;
+      white-space:nowrap;text-align:right;
+    }}
+    .ev-urgent .ev-time{{color:var(--orange);font-weight:700}}
+    .no-events{{color:var(--muted);font-size:.85rem;padding:4px 0}}
+    footer{{font-size:.7rem;color:#2a2a3a;text-align:center}}
+    code{{
+      background:var(--border);padding:2px 7px;
+      border-radius:4px;color:var(--blue);font-size:.9em;
+    }}
   </style>
 </head>
 <body>
+  <header>
+    <h1>&#x2694;&#xFE0F;&nbsp;Diablo&nbsp;4 Discord Bot</h1>
+    <p>Status dashboard &bull; auto-refreshes every 30&thinsp;s</p>
+  </header>
+
   <div class="card">
-    <h1>&#x2694;&#xFE0F; Diablo 4 Discord Bot</h1>
-    <p class="sub">Live status &bull; auto-refreshes every 30&thinsp;s</p>
+    <div class="card-label">Bot Status</div>
     <div class="row">
-      <span class="lbl">Status</span>
-      <span class="badge">{status_icon}&thinsp;{status_text}</span>
+      <span class="lbl">Connection</span>
+      <span class="badge {status_cls}">{status_text}</span>
     </div>
     <div class="row">
-      <span class="lbl">Bot account</span>
+      <span class="lbl">Account</span>
       <span class="val">{bot_name}</span>
     </div>
     <div class="row">
@@ -616,34 +732,44 @@ def _build_status_html() -> str:
       <span class="val">{guild_count}</span>
     </div>
     <div class="row">
-      <span class="lbl">Database</span>
-      <span class="val">{db_status}</span>
-    </div>
-    <div class="row">
       <span class="lbl">Event scanner</span>
       <span class="val">{scanner_text}</span>
     </div>
+    <div class="row">
+      <span class="lbl">Database</span>
+      <span class="val">{db_status}</span>
+    </div>
     {error_row}
     <div class="row">
-      <span class="lbl">Page generated</span>
-      <span class="ts">{now_utc}</span>
+      <span class="lbl">Generated</span>
+      <span class="val ts">{now_utc}</span>
     </div>
   </div>
-  <footer>UptimeRobot: monitor <code>/health</code> &mdash; expects&thinsp;200&thinsp;OK</footer>
+
+  <div class="card">
+    <div class="card-label">Upcoming D4 Events</div>
+    {events_html}
+  </div>
+
+  <footer>
+    UptimeRobot: point monitor at <code>/health</code> &mdash; returns 200&nbsp;OK every ping
+  </footer>
 </body>
 </html>"""
-1
+
+
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path == "/health":
             body = b"ok"
-            content_type = "text/plain"
+            content_type = "text/plain; charset=utf-8"
         else:
             body = _build_status_html().encode("utf-8")
             content_type = "text/html; charset=utf-8"
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -665,6 +791,7 @@ async def _bot_loop() -> None:
     global _last_error
     delay = 30
     while True:
+        connect_time = asyncio.get_event_loop().time()
         try:
             _last_error = "Connecting to Discord..."
             print("[bot] Connecting to Discord...", flush=True)
@@ -675,8 +802,8 @@ async def _bot_loop() -> None:
             bot.http.connector = discord.utils.MISSING
             await bot.start(TOKEN)
             break  # clean shutdown
-        except discord.LoginFailure as e:
-            _last_error = "LoginFailure: bad token \u2014 update DISCORD_BOT_TOKEN in Render Environment"
+        except discord.LoginFailure:
+            _last_error = "LoginFailure: bad token — update DISCORD_BOT_TOKEN in bot.env"
             print(f"[bot] {_last_error}", flush=True)
             try:
                 await bot.close()
@@ -684,17 +811,21 @@ async def _bot_loop() -> None:
                 pass
             await asyncio.sleep(300)
         except Exception as e:
-            # 429 from Cloudflare means the IP is banned — stop hammering it.
+            # 429 from Cloudflare/Discord means the IP is rate-limited — back off hard.
             if "429" in str(e) or "Too Many Requests" in str(e):
                 wait = 1800  # 30 minutes
-                _last_error = f"IP rate-limited by Discord/Cloudflare — waiting {wait//60} min before retry"
+                _last_error = f"Rate-limited by Discord/Cloudflare — waiting {wait // 60} min"
                 print(f"[bot] {_last_error}", flush=True)
                 try:
                     await bot.close()
                 except Exception:
                     pass
                 await asyncio.sleep(wait)
+                delay = 30  # reset backoff after long rate-limit pause
                 continue
+            # If we stayed connected for at least 60 s, reset the backoff counter.
+            if asyncio.get_event_loop().time() - connect_time > 60:
+                delay = 30
             _last_error = f"{type(e).__name__}: {e} (retrying in {delay}s)"
             print(f"[bot] {_last_error}", flush=True)
             try:
@@ -706,7 +837,3 @@ async def _bot_loop() -> None:
 
 
 asyncio.run(_bot_loop())
-
-
-
-
