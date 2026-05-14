@@ -3,6 +3,7 @@ import re
 import json
 import asyncio
 import threading
+import html
 import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone, timedelta
@@ -372,11 +373,6 @@ async def event_scanner() -> None:
     start_window = now + timedelta(minutes=WARN_MINUTES - 1)
     end_window = now + timedelta(minutes=WARN_MINUTES + 1)
 
-    # Drop alert keys for events more than 2 hours in the past to prevent unbounded growth.
-    cutoff_ts = (now - timedelta(hours=2)).timestamp()
-    stale = {key for key in alerted_keys if key[0] // 10 < cutoff_ts}
-    alerted_keys.difference_update(stale)
-
     try:
         events = await fetch_schedule()
     except Exception as e:
@@ -555,17 +551,21 @@ _last_error: str = "Starting..."
 
 def _build_status_html() -> str:
     is_ready = not bot.is_closed() and bot.user is not None
-    bot_name = str(bot.user) if bot.user else "Not connected"
+    bot_name = html.escape(str(bot.user) if bot.user else "Not connected")
     guild_count = len(bot.guilds)
-    db_status = "Configured" if DATABASE_URL else "Not configured (using local file)"
+    db_status = "Configured (PostgreSQL)" if DATABASE_URL else "Local file"
     status_color = "#2ecc71" if is_ready else "#e74c3c"
     status_text = "Online" if is_ready else "Offline / Starting"
     status_icon = "&#x2705;" if is_ready else "&#x274C;"
     scanner_text = "Running" if event_scanner.is_running() else "Stopped"
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    r, g, b = int(status_color[1:3], 16), int(status_color[3:5], 16), int(status_color[5:7], 16)
+    badge_bg = f"rgba({r},{g},{b},0.13)"
+    badge_border = f"rgba({r},{g},{b},0.30)"
     error_row = "" if is_ready else f"""
     <div class="row">
       <span class="label">Last error</span>
-      <span class="value" style="color:#e74c3c;font-size:0.8rem;max-width:260px;word-break:break-word;text-align:right">{_last_error}</span>
+      <span class="err">{html.escape(_last_error)}</span>
     </div>"""
 
     return f"""<!DOCTYPE html>
@@ -573,54 +573,66 @@ def _build_status_html() -> str:
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="refresh" content="30">
   <title>Diablo 4 Bot Status</title>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-           background: #1a1a2e; color: #eee; display: flex; justify-content: center;
-           align-items: center; min-height: 100vh; margin: 0; }}
-    .card {{ background: #16213e; border-radius: 12px; padding: 40px 50px;
-             box-shadow: 0 8px 32px rgba(0,0,0,0.4); max-width: 420px; width: 100%; }}
-    h1 {{ margin: 0 0 8px; font-size: 1.5rem; color: #c0392b; }}
-    .subtitle {{ color: #888; font-size: 0.9rem; margin-bottom: 30px; }}
-    .row {{ display: flex; justify-content: space-between; padding: 12px 0;
-            border-bottom: 1px solid #0f3460; font-size: 0.95rem; }}
-    .row:last-child {{ border-bottom: none; }}
-    .label {{ color: #aaa; }}
-    .value {{ font-weight: 600; }}
-    .badge {{ background: {status_color}22; color: {status_color};
-              padding: 3px 10px; border-radius: 20px; font-size: 0.85rem; }}
+    *{{box-sizing:border-box;margin:0;padding:0}}
+    body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+         background:#1a1a2e;color:#eee;display:flex;flex-direction:column;
+         justify-content:center;align-items:center;min-height:100vh;gap:14px}}
+    .card{{background:#16213e;border-radius:12px;padding:36px 44px;
+           box-shadow:0 8px 32px rgba(0,0,0,.5);max-width:440px;width:90%}}
+    h1{{font-size:1.4rem;color:#c0392b;margin-bottom:4px}}
+    .sub{{color:#555;font-size:.82rem;margin-bottom:26px}}
+    .row{{display:flex;justify-content:space-between;align-items:center;
+          padding:11px 0;border-bottom:1px solid #0f3460;font-size:.9rem;gap:12px}}
+    .row:last-child{{border-bottom:none}}
+    .lbl{{color:#888;white-space:nowrap}}
+    .val{{font-weight:600;text-align:right}}
+    .badge{{background:{badge_bg};color:{status_color};
+            padding:3px 12px;border-radius:20px;font-size:.82rem;
+            font-weight:600;border:1px solid {badge_border}}}
+    .err{{color:#e74c3c;font-size:.78rem;max-width:230px;
+          word-break:break-word;text-align:right}}
+    .ts{{color:#444;font-size:.78rem;text-align:right}}
+    footer{{font-size:.72rem;color:#333}}
+    code{{background:#0f3460;padding:1px 5px;border-radius:4px;color:#7ec8e3}}
   </style>
 </head>
 <body>
   <div class="card">
     <h1>&#x2694;&#xFE0F; Diablo 4 Discord Bot</h1>
-    <div class="subtitle">Live status dashboard</div>
+    <p class="sub">Live status &bull; auto-refreshes every 30&thinsp;s</p>
     <div class="row">
-      <span class="label">Status</span>
-      <span class="badge">{status_icon} {status_text}</span>
+      <span class="lbl">Status</span>
+      <span class="badge">{status_icon}&thinsp;{status_text}</span>
     </div>
     <div class="row">
-      <span class="label">Bot account</span>
-      <span class="value">{bot_name}</span>
+      <span class="lbl">Bot account</span>
+      <span class="val">{bot_name}</span>
     </div>
     <div class="row">
-      <span class="label">Servers</span>
-      <span class="value">{guild_count}</span>
+      <span class="lbl">Servers</span>
+      <span class="val">{guild_count}</span>
     </div>
     <div class="row">
-      <span class="label">Database</span>
-      <span class="value">{db_status}</span>
+      <span class="lbl">Database</span>
+      <span class="val">{db_status}</span>
     </div>
     <div class="row">
-      <span class="label">Scanner</span>
-      <span class="value">{scanner_text}</span>
+      <span class="lbl">Event scanner</span>
+      <span class="val">{scanner_text}</span>
     </div>
     {error_row}
+    <div class="row">
+      <span class="lbl">Page generated</span>
+      <span class="ts">{now_utc}</span>
+    </div>
   </div>
+  <footer>UptimeRobot: monitor <code>/health</code> &mdash; expects&thinsp;200&thinsp;OK</footer>
 </body>
 </html>"""
-
-
+1
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path == "/health":
@@ -653,7 +665,6 @@ async def _bot_loop() -> None:
     global _last_error
     delay = 30
     while True:
-        connect_time = asyncio.get_event_loop().time()
         try:
             _last_error = "Connecting to Discord..."
             print("[bot] Connecting to Discord...", flush=True)
@@ -665,7 +676,7 @@ async def _bot_loop() -> None:
             await bot.start(TOKEN)
             break  # clean shutdown
         except discord.LoginFailure as e:
-            _last_error = "LoginFailure: bad token — update DISCORD_BOT_TOKEN in bot.env"
+            _last_error = "LoginFailure: bad token \u2014 update DISCORD_BOT_TOKEN in Render Environment"
             print(f"[bot] {_last_error}", flush=True)
             try:
                 await bot.close()
@@ -683,11 +694,7 @@ async def _bot_loop() -> None:
                 except Exception:
                     pass
                 await asyncio.sleep(wait)
-                delay = 30  # reset backoff after long rate-limit pause
                 continue
-            # If we stayed connected for at least 60 s before crashing, reset backoff.
-            if asyncio.get_event_loop().time() - connect_time > 60:
-                delay = 30
             _last_error = f"{type(e).__name__}: {e} (retrying in {delay}s)"
             print(f"[bot] {_last_error}", flush=True)
             try:
@@ -699,3 +706,7 @@ async def _bot_loop() -> None:
 
 
 asyncio.run(_bot_loop())
+
+
+
+
