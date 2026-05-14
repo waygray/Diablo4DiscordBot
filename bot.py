@@ -773,6 +773,20 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_HEAD(self) -> None:
+        if self.path == "/health":
+            body = b"ok"
+            content_type = "text/plain; charset=utf-8"
+        else:
+            body = _build_status_html().encode("utf-8")
+            content_type = "text/html; charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        # HEAD: no body
+
     def log_message(self, *args) -> None:
         pass  # suppress access logs
 
